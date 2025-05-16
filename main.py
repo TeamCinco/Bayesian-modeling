@@ -242,9 +242,11 @@ def main():
     """Main function to run Bayesian regime detection analysis on multiple stock files"""
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Bayesian Market Regime Analysis')
-    parser.add_argument('--data_dir', type=str, default='/Users/jazzhashzzz/Desktop/Cinco-Quant/00_raw_data/5.15',
+    parser.add_argument('--data_dir', type=str, default=r"C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\5.16",
+                        #default='/Users/jazzhashzzz/Desktop/Cinco-Quant/00_raw_data/5.15',
                         help='Directory containing CSV files')
-    parser.add_argument('--output_dir', type=str, default='/Users/jazzhashzzz/Desktop/Cinco-Quant/00_raw_data/regime_analysis',
+    parser.add_argument('--output_dir', type=str, default=r"C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\regime_analysis5.16",                        
+                        #default='C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\regime_analysis5.16',
                         help='Directory to save output files')
     parser.add_argument('--n_regimes', type=int, default=3,
                         help='Number of regimes to identify')
