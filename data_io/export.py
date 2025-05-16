@@ -14,112 +14,70 @@ import pandas as pd
 from datetime import datetime, date  # Import date explicitly for isinstance check
 
 
-def export_regime_data_to_json(results, output_path, indent=2):
+# In data_io/export.py
+def export_regime_data_to_json(results, output_file, ticker=None):
     """
-    Export regime analysis results to JSON format
+    Export regime analysis results to JSON for web visualization
     
     Parameters:
     -----------
     results : dict
-        Analysis results dictionary containing regimes, statistics, etc.
-    output_path : str
-        Path to save the JSON file
-    indent : int, optional
-        Indentation level for the JSON file
-        
-    Returns:
-    --------
-    output_path : str
-        Path to the created JSON file
+        Analysis results from analyze_market_regimes
+    output_file : str
+        Path to output JSON file
+    ticker : str, optional
+        Ticker symbol
     """
     # Extract data
     dates = results['dates']
     regimes = results['regimes']
-    regime_stats = results['regime_stats']
-    regime_probs = results.get('regime_probs', None)
+    ohlcv = results['ohlcv']
     
-    # Debug information to identify length mismatches
-    print(f"Debug - Lengths: dates={len(dates)}, regimes={len(regimes)}")
-    if regime_probs:
-        print(f"Debug - regime_probs length: {len(regime_probs)}")
+    # Calculate n_regimes safely
+    if isinstance(regimes, (list, tuple)) and len(regimes) > 0:
+        n_regimes = max(regimes) + 1
+    elif hasattr(regimes, 'size') and regimes.size > 0:  # NumPy array
+        n_regimes = int(regimes.max()) + 1
+    else:
+        n_regimes = 0
     
-    # Create output dictionary
-    output_data = {
-        'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'n_regimes': max(regimes) + 1 if regimes else 0,  # Handle empty regimes list
-        'n_observations': len(dates),
-        'data_range': {
-            'start_date': dates[0] if dates else None,
-            'end_date': dates[-1] if dates else None
-        },
-        'current_regime': {
-            'regime': regimes[-1] if regimes else None,
-            'probability': regime_probs[-1][regimes[-1]] if regime_probs and regimes and regime_probs[-1] else None
-        },
-        'regime_statistics': regime_stats,
+    # Create export data
+    export_data = {
+        'ticker': ticker if ticker else 'Unknown',
+        'dates': dates,
+        'regimes': regimes.tolist() if hasattr(regimes, 'tolist') else regimes,  # Convert NumPy array to list if needed
+        'n_regimes': n_regimes,  # Safe calculation
+        'prices': {
+            'open': ohlcv.get('open', []),
+            'high': ohlcv.get('high', []),
+            'low': ohlcv.get('low', []),
+            'close': ohlcv.get('close', []),
+            'volume': ohlcv.get('volume', [])
+        }
     }
     
-    # Add time series data
-    time_series = []
-    if dates:  # Ensure dates list is not empty
-        # Find the minimum length between dates and regimes to avoid index errors
-        min_length = min(len(dates), len(regimes)) if regimes else 0
-        
-        for i in range(min_length):
-            try:
-                entry = {
-                    'date': dates[i],
-                    'regime': int(regimes[i])
-                }
-                
-                # Add regime probabilities if available
-                if regime_probs and i < len(regime_probs) and regime_probs[i]:
-                    entry['probabilities'] = {
-                        f'regime_{j}': float(regime_probs[i][j]) 
-                        for j in range(len(regime_probs[i]))
-                    }
-                    
-                time_series.append(entry)
-            except (IndexError, ValueError) as e:
-                print(f"Warning: Issue processing entry at index {i}: {str(e)}")
-                continue
+    # Add regime probabilities if available
+    if 'regime_probs' in results:
+        export_data['regime_probs'] = [probs.tolist() if hasattr(probs, 'tolist') else probs 
+                                       for probs in results['regime_probs']]
     
-    output_data['time_series'] = time_series
+    # Add regime statistics if available
+    if 'regime_stats' in results:
+        export_data['regime_stats'] = []
+        for stat in results['regime_stats']:
+            export_stat = {k: v for k, v in stat.items()}
+            # Convert any dates to string
+            if 'start_date' in export_stat and export_stat['start_date']:
+                export_stat['start_date'] = str(export_stat['start_date'])
+            if 'end_date' in export_stat and export_stat['end_date']:
+                export_stat['end_date'] = str(export_stat['end_date'])
+            export_data['regime_stats'].append(export_stat)
     
-    # Ensure directory exists
-    # Check if output_path has a directory part
-    dir_name = os.path.dirname(output_path)
-    if dir_name:  # Only create if there's a directory part
-        os.makedirs(dir_name, exist_ok=True)
+    # Write to JSON file
+    with open(output_file, 'w') as f:
+        json.dump(export_data, f, indent=2, default=str)  # default=str helps with datetime objects
     
-    # Save to JSON file
-    with open(output_path, 'w') as f:
-        # Handle NumPy types and datetime objects that aren't JSON serializable
-        class NumpyEncoder(json.JSONEncoder):
-            def default(self, obj):
-                if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
-                                    np.int16, np.int32, np.int64, np.uint8,
-                                    np.uint16, np.uint32, np.uint64)):
-                    return int(obj)
-                elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
-                    return float(obj)
-                elif isinstance(obj, (np.complex_, np.complex64, np.complex128)):
-                    return {'real': obj.real, 'imag': obj.imag}
-                elif isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                elif isinstance(obj, np.bool_):
-                    return bool(obj)
-                elif isinstance(obj, np.void):
-                    return None
-                elif isinstance(obj, (datetime, date)):  # Handle datetime.datetime and datetime.date
-                    return obj.isoformat()
-                return json.JSONEncoder.default(self, obj)
-        
-        json.dump(output_data, f, cls=NumpyEncoder, indent=indent)
-    
-    print(f"Regime data exported to JSON: {output_path}")
-    return output_path
-
+    print(f"Data exported to {output_file}")
 
 def export_regime_data_to_csv(results, output_path, include_probabilities=True):
     """

@@ -36,14 +36,19 @@ def save_results(results, output_dir, ticker='SPY'):
                 results['dates'][i],
                 results['ohlcv']['close'][i],
                 results['features']['log_returns'][i-1],  # Offset because returns start at index 1
-                results['features']['volatility'][i-1],
-                results['features']['atr'][i],
-                results['regimes'][i-1] + 1,  # 1-indexed for readability
+                results['features'].get('volatility', [0] * len(results['dates']))[i-1] if 'volatility' in results['features'] and i-1 < len(results['features']['volatility']) else 0,
+                results['features'].get('atr', [0] * len(results['dates']))[i] if 'atr' in results['features'] and i < len(results['features'].get('atr', [])) else 0,
+                results['regimes'][i-1] + 1 if i-1 < len(results['regimes']) else 0,  # 1-indexed for readability
             ]
             
-            # Add regime probabilities
-            for p in results['regime_probs'][i-1]:
-                row.append(f"{p:.4f}")
+            # Add regime probabilities if available
+            if 'regime_probs' in results and i-1 < len(results['regime_probs']):
+                for p in results['regime_probs'][i-1]:
+                    row.append(f"{p:.4f}")
+            else:
+                # Add placeholders if regime_probs not available
+                for _ in range(results.get('hmm_model', {}).get('n_regimes', 3)):
+                    row.append("0.0000")
                 
             writer.writerow(row)
     
@@ -61,15 +66,15 @@ def save_results(results, output_dir, ticker='SPY'):
                 f"{stat['percentage']:.2f}",
                 f"{stat['mean_return']*100:.4f}",
                 f"{stat['volatility']*100:.4f}",
-                f"{stat['sharpe']:.4f}",
-                f"{stat['mean_atr']:.6f}",
-                stat['start_date'],
-                stat['end_date'],
-                stat['description']
+                f"{stat.get('sharpe', 0):.4f}",  # Use .get() with default value
+                f"{stat.get('mean_atr', 0.01):.6f}",  # Use .get() with default value
+                stat.get('start_date', ''),
+                stat.get('end_date', ''),
+                stat.get('description', '')
             ])
     
-    # Save HMM model parameters
-    model_file = os.path.join(output_dir, f"{ticker}_hmm_params.csv")
+    # Save model parameters - check which type of model is used
+    model_file = os.path.join(output_dir, f"{ticker}_model_params.csv")
     with open(model_file, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Parameter', 'Value'])
@@ -77,21 +82,54 @@ def save_results(results, output_dir, ticker='SPY'):
         # Save number of regimes
         writer.writerow(['n_regimes', results['hmm_model'].n_regimes])
         
-        # Save mean parameters
-        for i, mu in enumerate(results['hmm_model'].mu):
-            writer.writerow([f'mu_regime_{i+1}', f"{mu:.6f}"])
+        # Check model type and save appropriate parameters
+        if hasattr(results['hmm_model'], 'mu') and hasattr(results['hmm_model'], 'sigma'):
+            # It's a BayesianHMM model
+            writer.writerow(['model_type', 'BayesianHMM'])
+            
+            # Save mean parameters
+            for i, mu in enumerate(results['hmm_model'].mu):
+                writer.writerow([f'mu_regime_{i+1}', f"{mu:.6f}"])
+            
+            # Save volatility parameters
+            for i, sigma in enumerate(results['hmm_model'].sigma):
+                writer.writerow([f'sigma_regime_{i+1}', f"{sigma:.6f}"])
+            
+            # Save transition matrix if it exists
+            if hasattr(results['hmm_model'], 'trans_mat') or hasattr(results['hmm_model'], 'transmat_'):
+                writer.writerow(['transition_matrix', ''])
+                trans_mat = getattr(results['hmm_model'], 'trans_mat', None)
+                if trans_mat is None:
+                    trans_mat = getattr(results['hmm_model'], 'transmat_', [])
+                
+                for i, row in enumerate(trans_mat):
+                    writer.writerow([f'trans_from_regime_{i+1}', ','.join(f"{p:.4f}" for p in row)])
+            
+            # Save initial probabilities if they exist
+            if hasattr(results['hmm_model'], 'init_probs') or hasattr(results['hmm_model'], 'startprob_'):
+                init_probs = getattr(results['hmm_model'], 'init_probs', None)
+                if init_probs is None:
+                    init_probs = getattr(results['hmm_model'], 'startprob_', [])
+                
+                writer.writerow(['initial_probs', ','.join(f"{p:.4f}" for p in init_probs)])
         
-        # Save volatility parameters
-        for i, sigma in enumerate(results['hmm_model'].sigma):
-            writer.writerow([f'sigma_regime_{i+1}', f"{sigma:.6f}"])
+        elif hasattr(results['hmm_model'], 'gmm'):
+            # It's a BayesianRegimePersistence model
+            writer.writerow(['model_type', 'BayesianRegimePersistence'])
+            
+            # Save GMM parameters if available
+            if results['hmm_model'].gmm is not None:
+                writer.writerow(['gmm_means', ','.join(f"{m[0]:.6f}" for m in results['hmm_model'].gmm.means_)])
+                writer.writerow(['gmm_covariances', ','.join(f"{c[0][0]:.6f}" for c in results['hmm_model'].gmm.covariances_)])
+                writer.writerow(['gmm_weights', ','.join(f"{w:.4f}" for w in results['hmm_model'].gmm.weights_)])
+            
+            # Save feature names
+            if hasattr(results['hmm_model'], 'feature_names') and results['hmm_model'].feature_names:
+                writer.writerow(['feature_names', ','.join(results['hmm_model'].feature_names)])
         
-        # Save transition matrix
-        writer.writerow(['transition_matrix', ''])
-        for i, row in enumerate(results['hmm_model'].transmat_):
-            writer.writerow([f'trans_from_regime_{i+1}', ','.join(f"{p:.4f}" for p in row)])
-        
-        # Save initial probabilities
-        writer.writerow(['initial_probs', ','.join(f"{p:.4f}" for p in results['hmm_model'].startprob_)])
+        else:
+            # Unknown model type
+            writer.writerow(['model_type', 'Unknown'])
     
     # Save extended statistics if available
     if 'extended_stats' in results:
@@ -194,18 +232,29 @@ def save_results(results, output_dir, ticker='SPY'):
     
     # Save all results as numpy arrays for later use
     np_file = os.path.join(output_dir, f"{ticker}_results.npz")
-    np.savez(
-        np_file,
-        dates=np.array(results['dates']),
-        regimes=np.array(results['regimes']),
-        regime_stats=results['regime_stats'],
-        hmm_model=results['hmm_model'],
-        regime_mapping=results.get('regime_mapping', {}),
-        regime_probs=np.array(results['regime_probs']),
-        extended_stats=results.get('extended_stats', []),
-        risk_metrics=results.get('risk_metrics', []),
-        duration_stats=results.get('duration_stats', {})
-    )
+    
+    # Create a dictionary of items to save, checking each one
+    save_dict = {
+        'dates': np.array(results['dates']),
+        'regimes': np.array(results['regimes']),
+        'regime_stats': results['regime_stats'],
+    }
+    
+    # Add optional items if they exist
+    if 'hmm_model' in results:
+        save_dict['model_type'] = np.array([type(results['hmm_model']).__name__])
+    if 'regime_probs' in results:
+        save_dict['regime_probs'] = np.array(results['regime_probs'])
+    if 'regime_mapping' in results:
+        save_dict['regime_mapping'] = results['regime_mapping']
+    if 'extended_stats' in results:
+        save_dict['extended_stats'] = results['extended_stats']
+    if 'risk_metrics' in results:
+        save_dict['risk_metrics'] = results['risk_metrics']
+    if 'duration_stats' in results:
+        save_dict['duration_stats'] = results['duration_stats']
+    
+    np.savez(np_file, **save_dict)
     
     print(f"Results saved to {output_dir}")
 
@@ -319,23 +368,27 @@ def add_to_summary(summary_file, ticker, current_regime, recommendations=None, e
             expected_duration = ''
             stability = ''
             
-            if 'forecasts' in recommendations and 'stability' in recommendations['forecasts']:
+            if recommendations and 'forecasts' in recommendations and 'stability' in recommendations['forecasts']:
                 stability_info = recommendations['forecasts']['stability']
                 expected_duration = stability_info.get('expected_remaining_duration', '')
                 stability = stability_info.get('stability_description', '')
             
             # Add successful analysis to summary
-            writer.writerow([
-                ticker,
-                current_regime + 1,  # 1-indexed for readability
-                recommendations['current_regime'],
-                recommendations['primary_strategy'],
-                recommendations['alternative_strategy'],
-                recommendations['position_sizing'],
-                recommendations['wing_width'],
-                recommendations['expiration'],
-                recommendations['confidence'],
-                f"{recommendations['transition_risk']['description']} ({recommendations['transition_risk']['probability']:.2f})",
-                expected_duration,
-                stability
-            ])
+            if recommendations:
+                writer.writerow([
+                    ticker,
+                    current_regime + 1 if current_regime is not None else '',  # 1-indexed for readability
+                    recommendations.get('current_regime', ''),
+                    recommendations.get('primary_strategy', ''),
+                    recommendations.get('alternative_strategy', ''),
+                    recommendations.get('position_sizing', ''),
+                    recommendations.get('wing_width', ''),
+                    recommendations.get('expiration', ''),
+                    recommendations.get('confidence', ''),
+                    f"{recommendations.get('transition_risk', {}).get('description', '')} ({recommendations.get('transition_risk', {}).get('probability', 0):.2f})" if 'transition_risk' in recommendations else '',
+                    expected_duration,
+                    stability
+                ])
+            else:
+                # Fallback if recommendations is None but no error was provided
+                writer.writerow([ticker, str(current_regime) if current_regime is not None else 'UNKNOWN', '', '', '', '', '', '', '', '', '', ''])

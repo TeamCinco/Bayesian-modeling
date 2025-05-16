@@ -25,8 +25,13 @@ def analyze_regime_statistics(regimes, features, ohlcv, dates):
     
     # Extract needed features
     returns = features['log_returns']
-    volatility = features['volatility']
-    atr = features['atr']
+    volatility = features.get('volatility', [0] * len(returns))
+    
+    # Check if 'atr' exists in features, if not create a default array
+    if 'atr' in features:
+        atr = features['atr']
+    else:
+        atr = [0.01] * len(returns)  # Default value if ATR not available
     
     for regime in range(n_regimes):
         # Find indices for this regime
@@ -36,27 +41,28 @@ def analyze_regime_statistics(regimes, features, ohlcv, dates):
             continue
         
         # Collect regime data
-        regime_returns = [returns[i] for i in indices]
-        regime_volatility = [volatility[i] for i in indices]
-        regime_atr = [atr[i] for i in indices]
+        regime_returns = [returns[i] for i in indices if i < len(returns)]
+        regime_volatility = [volatility[i] for i in indices if i < len(volatility)]
+        regime_atr = [atr[i] for i in indices if i < len(atr)]
         
         # Calculate statistics
         count = len(indices)
         percentage = (count / len(regimes)) * 100
         
         # Return statistics
-        mean_return = sum(regime_returns) / count if count > 0 else 0
-        regime_vol = math.sqrt(sum(r**2 for r in regime_returns) / count) if count > 0 else 0
+        mean_return = sum(regime_returns) / count if count > 0 and regime_returns else 0
+        regime_vol = sum(r**2 for r in regime_returns) / count if count > 0 and regime_returns else 0
+        regime_vol = math.sqrt(regime_vol) if regime_vol > 0 else 0
         
         # Sharpe ratio (annualized)
         sharpe = (mean_return * 252) / (regime_vol * math.sqrt(252)) if regime_vol > 0 else 0
         
-        # ATR statistics
-        mean_atr = sum(regime_atr) / count if count > 0 else 0
+        # ATR statistics - safe handling if regime_atr is empty
+        mean_atr = sum(regime_atr) / count if count > 0 and regime_atr else 0.01
         
         # Date ranges
-        start_date = dates[indices[0]] if indices else None
-        end_date = dates[indices[-1]] if indices else None
+        start_date = dates[indices[0]] if indices and indices[0] < len(dates) else None
+        end_date = dates[indices[-1]] if indices and indices[-1] < len(dates) else None
         
         # Create description based on statistics
         description = regime_description(mean_return, regime_vol, sharpe, mean_atr)
@@ -69,7 +75,7 @@ def analyze_regime_statistics(regimes, features, ohlcv, dates):
             'mean_return': mean_return,
             'volatility': regime_vol,
             'sharpe': sharpe,
-            'mean_atr': mean_atr,
+            'mean_atr': mean_atr,  # Ensure this is always included
             'start_date': start_date,
             'end_date': end_date,
             'description': description

@@ -6,8 +6,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-# Import our modules
-from models.bayesian_hmm import BayesianHMM
+from models.bayesian import BayesianHMM, BayesianRegimePersistence
 from features.feature_extractor import FeatureExtractor
 from data.data_loader import load_csv_data
 from data.feature_processor import normalize_features, combine_features
@@ -98,22 +97,115 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         # Normalize features
         normalized_features = normalize_features(features)
         
-        # Combine features into a single series
-        combined_feature = combine_features(normalized_features, weights=feature_weights)
+        # ---- FIX: Handle length mismatch between dates and features ----
+        # For log_returns (typically one fewer than dates)
+        return_dates = dates
+        if len(features['log_returns']) != len(dates):
+            # Use the dates that match the length of log_returns
+            return_dates = dates[:len(features['log_returns'])]
         
-        # Add combined feature to the features dict for future use
-        features['combined'] = combined_feature
+        # Create pandas Series with matching length
+        return_series = pd.Series(features['log_returns'], index=return_dates)
         
-        # Fit Bayesian HMM
-        hmm = BayesianHMM(n_regimes=n_regimes)
-        hmm.fit(combined_feature, max_iter=100)
+        # Create features DataFrame with matching indices
+        features_dict = {}
+        for key, values in normalized_features.items():
+            feature_dates = dates[:len(values)]  # Truncate dates to match feature length
+            features_dict[key] = pd.Series(values, index=feature_dates)
         
-        # Analyze market regimes
-        results = analyze_market_regimes(dates, ohlcv, features, hmm, n_regimes=n_regimes)
+        features_df = pd.DataFrame(features_dict)
+        # ---- End of length mismatch fix ----
+        
+        # Initialize Bayesian regime persistence model
+        model = BayesianRegimePersistence(
+            n_regimes=n_regimes, 
+            features=list(feature_weights.keys())
+        )
+        
+        # Step 1: Classify historical data into regimes
+        regimes = model.classify_regimes(return_series, window=feature_config['volatility_window'])
+        
+        # Step 2: Fit persistence model with features
+        model.fit_persistence_model(regimes, features_df=features_df)
+        
+        # Create results structure
+        results = {
+            'dates': dates,
+            'ohlcv': ohlcv,
+            'features': features,
+            'regimes': regimes,
+            'hmm_model': model,  # For compatibility with existing code
+        }
+        
+        # If model has predict_proba method, use it, otherwise create dummy probabilities
+        try:
+            results['regime_probs'] = model.predict_proba(features['log_returns'])
+        except AttributeError:
+            # Create simple one-hot encoding as fallback
+            probs = []
+            for r in regimes:
+                regime_prob = [0.0] * n_regimes
+                regime_prob[int(r)] = 1.0
+                probs.append(regime_prob)
+            results['regime_probs'] = probs
+        
+        # Analyze market regimes (using standard functions but with our models results)
+        # Use dates that match the length of regimes
+        regime_dates = dates[:len(regimes)]
+        
+        # ---- FIX: Create regime_stats from regimes data ----
+        # Calculate statistics for each regime
+        regime_stats = []
+        for r in range(n_regimes):
+            # Find indices for this regime
+            indices = [i for i, reg in enumerate(regimes) if reg == r]
+            
+            if not indices:
+                continue
+                
+            # Basic stats calculation
+            count = len(indices)
+            percentage = (count / len(regimes)) * 100
+            
+            # Return statistics
+            returns_data = [features['log_returns'][i] for i in indices if i < len(features['log_returns'])]
+            mean_return = sum(returns_data) / count if count > 0 else 0
+            
+            # Volatility (standard deviation of returns)
+            regime_vol = np.std(returns_data) if count > 1 else 0
+            
+            # Sharpe ratio (annualized)
+            sharpe = (mean_return * 252) / (regime_vol * np.sqrt(252)) if regime_vol > 0 else 0
+            
+            # Date ranges
+            start_date = regime_dates[indices[0]] if indices else None
+            end_date = regime_dates[indices[-1]] if indices else None
+            
+            # Create description based on statistics
+            vol_desc = "Low Volatility" if regime_vol < 0.008 else "Medium Volatility" if regime_vol < 0.015 else "High Volatility"
+            ret_desc = "Bearish" if mean_return < -0.001 else "Sideways" if mean_return < 0.001 else "Bullish"
+            description = f"{vol_desc}, {ret_desc}"
+            
+            # Add to regime stats
+            regime_stats.append({
+                'regime': r,
+                'count': count,
+                'percentage': percentage,
+                'mean_return': mean_return,
+                'volatility': regime_vol,
+                'sharpe': sharpe,
+                'start_date': start_date,
+                'end_date': end_date,
+                'description': description
+            })
+        
+        # Add regime_stats to results
+        results['regime_stats'] = regime_stats
+        # ---- End of regime_stats fix ----
         
         # Calculate extended regime statistics
         extended_stats = calculate_extended_regime_statistics(
-            results['regimes'], features, ohlcv, dates
+            regimes, features, ohlcv, regime_dates
         )
         
         # Add extended stats to results
@@ -124,7 +216,7 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         results['risk_metrics'] = risk_metrics
         
         # Analyze regime durations
-        duration_stats = analyze_regime_duration(results['regimes'], dates)
+        duration_stats = analyze_regime_duration(regimes, regime_dates)
         results['duration_stats'] = duration_stats
         
         # Create ticker-specific output directory
@@ -166,7 +258,7 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         )
         
         plot_regime_timeline(
-            dates, results['regimes'], results['regime_stats'], ohlcv,
+            regime_dates, regimes, results['regime_stats'], ohlcv,
             output_path=os.path.join(ticker_output_dir, f"{ticker}_regime_timeline.png")
         )
         
@@ -181,7 +273,7 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         )
         
         plot_performance_metrics(
-            results['regime_stats'], features, results['regimes'], dates,
+            results['regime_stats'], features, regimes, regime_dates,
             output_path=os.path.join(ticker_output_dir, f"{ticker}_performance_metrics.png")
         )
         
@@ -193,21 +285,26 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         )
         
         # Generate current regime forecast and strategy recommendation
-        current_regime = results['regimes'][-1]
-        forecasts = forecast_next_regime(results['hmm_model'], current_regime, horizon=5)
+        current_regime = regimes[-1]
+        
+        # Use Bayesian model for forecasting
+        persistence_prob = model.predict_persistence_prob(current_regime)
+        forecasts = model.forecast_regime(current_regime, horizon=5)
         
         # Get current regime duration
         current_duration = 1
-        for i in range(len(results['regimes'])-2, -1, -1):
-            if results['regimes'][i] == current_regime:
+        for i in range(len(regimes)-2, -1, -1):
+            if regimes[i] == current_regime:
                 current_duration += 1
             else:
                 break
         
         # Predict regime stability
-        stability = predict_regime_stability(
-            current_regime, current_duration, results['regimes'], dates
-        )
+        stability = {
+            'transition_likelihood': 1 - persistence_prob,
+            'current_duration': current_duration,
+            'stability_description': "Stable" if persistence_prob > 0.7 else "Unstable"
+        }
         
         # Keep forecasts as a list for recommend_option_strategy
         recommendations = recommend_option_strategy(
@@ -218,10 +315,12 @@ def process_single_file(file_path, n_regimes, feature_config, feature_weights, o
         
         # Add stability to recommendations after the fact
         recommendations['stability'] = stability
+        recommendations['persistence_probability'] = persistence_prob
         
         # Print recommendations
         print(f"\n=== {ticker} OPTION STRATEGY RECOMMENDATIONS ===")
         print(f"Current Regime: {recommendations['current_regime']}")
+        print(f"Persistence Probability: {persistence_prob:.4f}")
         print(f"Primary Strategy: {recommendations['primary_strategy']}")
         print(f"Alternative Strategy: {recommendations['alternative_strategy']}")
         print(f"Position Sizing: {recommendations['position_sizing']}")
@@ -265,7 +364,7 @@ def main():
     
     # Feature configuration
     feature_config = {
-        'volatility_window': 5,
+        'volatility_window': 20,  # Increased for Bayesian model
         'atr_window': 14,
         'bb_window': 20,
         'momentum_short': 10,
