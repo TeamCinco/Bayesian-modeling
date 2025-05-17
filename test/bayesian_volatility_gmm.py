@@ -1,68 +1,130 @@
 import pandas as pd
 import numpy as np
-# import matplotlib.pyplot as plt # No longer directly needed for plotting
 import glob
 import os
 import math
-import scipy.stats as stats
+# import scipy.stats as stats # No longer directly used, np and pd methods cover it
 from datetime import datetime
 from sklearn.mixture import GaussianMixture
-from scipy.stats import norm # Ensure norm is imported
+# from scipy.stats import norm # norm from scipy.stats is not explicitly used here.
 import pickle # For saving/loading intermediate results
 import multiprocessing # For parallel processing
 # Ensure openpyxl is installed: pip install openpyxl
 
 # Set the path to your data
 DATA_PATH = r"C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\5.16" # Example Path
-# DATA_PATH = "/Users/jazzhashzzz/Desktop/Cinco-Quant/00_raw_data/5.15" # Example Path
-
 
 def load_stock_data(folder_path):
-    """Load all CSV files from a folder into a dictionary of dataframes."""
+    """Load all CSV files from a folder into a dictionary of dataframes, standardizing OHLC column names."""
     all_data = {}
+    name_map = {
+        'open': ['open', 'o', 'first'],
+        'high': ['high', 'h', 'max'],
+        'low': ['low', 'l', 'min'],
+        'close': ['close', 'c', 'last', 'price'] # Add 'price' as a common alternative for close
+    }
+    required_cols_std = ['open', 'high', 'low', 'close']
+
     for file_path in glob.glob(os.path.join(folder_path, "*.csv")):
         symbol = os.path.basename(file_path).split('.')[0]
         try:
-            # print(f"Loading {symbol}...") # Can be verbose
             df = pd.read_csv(file_path)
-            date_cols = [col for col in df.columns if any(date_str in col.lower()
-                                                       for date_str in ['date', 'time'])]
-            if date_cols:
-                date_col = date_cols[0]
-                try:
-                    df[date_col] = pd.to_datetime(df[date_col])
-                    df.set_index(date_col, inplace=True)
-                except Exception as e:
-                    print(f"Could not parse dates in {symbol} ({date_col}): {e}, skipping date conversion")
+            df.columns = df.columns.str.lower().str.strip() # Standardize column names
 
-            if 'close' in df.columns:
-                all_data[symbol] = df
+            rename_dict = {}
+            found_cols = {}
+
+            for std_name, potential_names in name_map.items():
+                for pot_name in potential_names:
+                    if pot_name in df.columns:
+                        if std_name not in found_cols: # Take the first match
+                           rename_dict[pot_name] = std_name
+                           found_cols[std_name] = True
+                        break
+            
+            df.rename(columns=rename_dict, inplace=True)
+
+            # Ensure all standardized OHLC columns exist, coerce to numeric, handle missing
+            for col_std in required_cols_std:
+                if col_std not in df.columns:
+                    df[col_std] = np.nan # Add missing OHLC columns as NaN
+                df[col_std] = pd.to_numeric(df[col_std], errors='coerce')
+            
+            # Require at least 'close' to be mostly non-NaN
+            if 'close' not in df.columns or df['close'].isnull().all():
+                # print(f"Skipping {symbol}: 'close' column missing or all NaN after processing.")
+                continue
+            
+            df.dropna(subset=['close'], inplace=True) # Drop rows where 'close' is NaN after coercion
+            if df.empty:
+                # print(f"Skipping {symbol}: DataFrame empty after dropping NaN 'close' values.")
+                continue
+
+            date_cols = [col for col in df.columns if any(date_str in col.lower()
+                                                       for date_str in ['date', 'time', 'timestamp'])]
+            if date_cols:
+                date_col_name = date_cols[0] # Pick the first potential date column
+                try:
+                    # Attempt to convert to datetime, handling various potential formats
+                    df[date_col_name] = pd.to_datetime(df[date_col_name], errors='coerce')
+                    df.dropna(subset=[date_col_name], inplace=True) # Drop rows where date conversion failed
+                    if df.empty: continue
+
+                    df.set_index(date_col_name, inplace=True)
+                    df.sort_index(inplace=True)
+                except Exception as e:
+                    print(f"Could not parse or set dates for {symbol} ({date_col_name}): {e}. Skipping stock.")
+                    continue
+            elif isinstance(df.index, pd.DatetimeIndex):
+                 if not df.index.is_monotonic_increasing:
+                    df.sort_index(inplace=True)
             else:
-                close_cols = [col for col in df.columns if 'close' in col.lower()]
-                if close_cols:
-                    df.rename(columns={close_cols[0]: 'close'}, inplace=True)
-                    all_data[symbol] = df
-                    # print(f"Renamed column {close_cols[0]} to 'close' for {symbol}")
-                else:
-                    print(f"Skipping {symbol}: no 'close' column found")
+                # print(f"Warning: No date column found or index not DatetimeIndex for {symbol}. Analysis might be affected or skipped.")
+                continue # Skip if no valid date index can be established
+
+            all_data[symbol] = df[required_cols_std + [col for col in df.columns if col not in required_cols_std and col in found_cols.values()]].copy() # Keep only std OHLC + original other mapped cols
+            all_data[symbol] = df # Keep all columns after renaming and date processing
+
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            print(f"Error loading or processing {file_path}: {e}")
     return all_data
 
 def calculate_volatility(df, window=20):
-    log_returns = np.log(df['close'] / df['close'].shift(1))
-    volatility = log_returns.rolling(window=window).std() * np.sqrt(252)
+    if 'close' not in df.columns or df['close'].isnull().all():
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+    
+    prices = df['close'][df['close'] > 0].copy() 
+    if prices.empty:
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+        
+    shifted_prices = prices.shift(1)
+    valid_for_log_return = (prices > 0) & (shifted_prices > 0) 
+    log_returns = pd.Series(np.nan, index=df.index, dtype=float)
+    
+    if valid_for_log_return.any():
+        computed_log_returns_subset = np.log(prices[valid_for_log_return] / shifted_prices[valid_for_log_return])
+        log_returns.loc[computed_log_returns_subset.index] = computed_log_returns_subset
+
+    if log_returns.dropna().empty:
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+        
+    available_log_returns_count = len(log_returns.dropna())
+    min_p = max(1, window // 2) # Ensure min_periods is at least 1
+    if available_log_returns_count < min_p : # If not enough data for even min_periods
+        min_p = max(1,available_log_returns_count)
+
+    volatility = log_returns.rolling(window=window, min_periods=min_p).std() * np.sqrt(252)
     return volatility
+
 
 def count_transitions(regimes):
     regimes_clean = regimes.dropna()
     if regimes_clean.empty:
-        return np.zeros((0, 0)) # Return empty array that can be reshaped if needed
-
+        return np.zeros((0, 0))
     unique_regimes_from_data = sorted(regimes_clean.unique().astype(int))
-    if not unique_regimes_from_data:
+    if not unique_regimes_from_data: # e.g. if all regimes were NaN and then dropped
         return np.zeros((0,0))
-
+    # num_regimes_found should be based on max label + 1, assuming labels are 0-indexed
     num_regimes_found = max(unique_regimes_from_data) + 1 if unique_regimes_from_data else 0
     if num_regimes_found == 0:
         return np.zeros((0,0))
@@ -70,40 +132,62 @@ def count_transitions(regimes):
     transition_counts = np.zeros((num_regimes_found, num_regimes_found))
     prev_regime = None
     for regime_val in regimes_clean:
-        regime = int(regime_val)
+        regime = int(regime_val) # Ensure it's an int for indexing
         if prev_regime is not None:
+            # Check bounds before assignment
             if 0 <= prev_regime < num_regimes_found and 0 <= regime < num_regimes_found:
                  transition_counts[prev_regime, regime] += 1
-            # else: # Can be verbose
-                # print(f"Warning: Regime out of bounds. Prev: {prev_regime}, Curr: {regime}, Max_idx: {num_regimes_found-1}")
         prev_regime = regime
     return transition_counts
 
-def filter_data_by_date(data, start_date='2021-01-01', end_date=None):
+def filter_data_by_date(data, start_date='2010-01-01', end_date=None):
     if not isinstance(data.index, pd.DatetimeIndex):
-        # print("Warning: Data index is not a DatetimeIndex, skipping date filtering")
-        return data
-    start = pd.Timestamp(start_date)
-    end = pd.Timestamp(end_date) if end_date else pd.Timestamp.now().normalize()
-    filtered_data = data.loc[(data.index >= start) & (data.index <= end)].copy()
+        # print(f"Data for a stock does not have a DatetimeIndex. Skipping date filtering.")
+        return data 
+    if not data.index.is_monotonic_increasing: 
+        data = data.sort_index()
+
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date) if end_date else pd.Timestamp.now().normalize() 
+
+    if data.index.tz is not None:
+        start_ts = start_ts.tz_localize(data.index.tz) if start_ts.tzinfo is None else start_ts.tz_convert(data.index.tz)
+        end_ts = end_ts.tz_localize(data.index.tz) if end_ts.tzinfo is None else end_ts.tz_convert(data.index.tz)
+    else: # data.index is tz-naive
+        start_ts = start_ts.tz_localize(None) if start_ts.tzinfo is not None else start_ts
+        end_ts = end_ts.tz_localize(None) if end_ts.tzinfo is not None else end_ts
+            
+    filtered_data = data.loc[(data.index >= start_ts) & (data.index <= end_ts)].copy()
     return filtered_data
 
 def bayesian_transition_analysis(transition_counts, prior_strength=1.0):
     num_regimes = transition_counts.shape[0]
-    if num_regimes == 0: # Handles empty transition_counts
-        return np.array([]), {}, {}
-
+    if num_regimes == 0:
+        return np.array([]), {} 
     posterior_samples = {}
     mean_probs = np.zeros_like(transition_counts, dtype=float)
+    
+    rng = np.random.default_rng() # Create one RNG instance
+
     for from_regime in range(num_regimes):
         prior_alphas = np.ones(num_regimes) * prior_strength
         posterior_alphas = prior_alphas + transition_counts[from_regime]
-        if posterior_alphas.sum() == 0:
-            samples = np.zeros((10000, num_regimes))
-            mean_probs[from_regime] = np.zeros(num_regimes)
+
+        if np.all(posterior_alphas <= 0) or posterior_alphas.sum() == 0 : # Summing non-positives, or all zeros
+             # This case is tricky. If all posterior_alphas are zero (or non-positive for Dirichlet)
+             # it means no observations and zero prior.
+             # Default to uniform probability if num_regimes > 0, else empty.
+            if num_regimes > 0:
+                samples = np.full((10000, num_regimes), 1.0/num_regimes)
+                mean_probs[from_regime, :] = 1.0/num_regimes
+            else: # Should not happen if num_regimes > 0 check passed earlier
+                samples = np.empty((10000, 0)) 
+                # mean_probs[from_regime] will be empty slice if num_regimes is 0
         else:
-            samples = np.random.default_rng().dirichlet(posterior_alphas, size=10000)
-            mean_probs[from_regime] = posterior_alphas / posterior_alphas.sum()
+            # Ensure alphas are positive for Dirichlet
+            safe_posterior_alphas = np.maximum(posterior_alphas, 1e-9) # Ensure positive for dirichlet
+            samples = rng.dirichlet(safe_posterior_alphas, size=10000)
+            mean_probs[from_regime] = safe_posterior_alphas / safe_posterior_alphas.sum()
         posterior_samples[from_regime] = samples
     return mean_probs, posterior_samples
 
@@ -112,227 +196,405 @@ def calculate_probability_intervals(samples, confidence=0.95):
     upper_bound = 1 - lower_bound
     lower_probs = {}
     upper_probs = {}
+
+    if not samples: 
+        return lower_probs, upper_probs
+
     for from_regime, regime_samples in samples.items():
+        if not isinstance(regime_samples, np.ndarray) or regime_samples.size == 0:
+            # Attempt to infer num_to_regimes if possible, otherwise empty
+            # This case needs a consistent way to know the expected number of 'to' regimes
+            # For now, if samples are empty, assume no 'to' states can be inferred for this 'from' state
+            num_to_regimes = regime_samples.shape[1] if regime_samples.ndim == 2 else 0
+            lower_probs[from_regime] = np.full(num_to_regimes, np.nan)
+            upper_probs[from_regime] = np.full(num_to_regimes, np.nan)
+            continue
+        
+        # Ensure regime_samples is 2D for quantile calculation along axis=0
+        # GMM usually gives 2D (n_samples, n_features/n_components_probs)
+        # Dirichlet samples are (size, n_states) which is already 2D
+        if regime_samples.ndim == 1: # Unlikely for Dirichlet, but good check
+            # If 1D, implies samples for a single 'to_state' or one sample for multiple 'to_states'.
+            # np.quantile will work on 1D array (axis=0 implicitly).
+            pass
+
         lower_probs[from_regime] = np.quantile(regime_samples, lower_bound, axis=0)
         upper_probs[from_regime] = np.quantile(regime_samples, upper_bound, axis=0)
     return lower_probs, upper_probs
 
 def identify_volatility_regimes_gmm(volatility, num_regimes_target=3, random_state=42):
     clean_vol = volatility.dropna()
-    if len(clean_vol) < num_regimes_target: # GMM needs enough samples per component
-        print(f"Warning: Not enough clean volatility data points ({len(clean_vol)}) for GMM with {num_regimes_target} regimes. Skipping GMM.")
+    min_samples_needed = num_regimes_target * 5 
+    
+    # Default regime_info structure matching num_regimes_target
+    default_regime_info = {
+        'model': None, 'mapping': {}, 
+        'means': [np.nan] * num_regimes_target, 
+        'variances': [np.nan] * num_regimes_target, 
+        'weights': [np.nan] * num_regimes_target
+    }
+
+    if len(clean_vol) < min_samples_needed or len(clean_vol.unique()) < num_regimes_target :
         regimes = pd.Series(np.nan, index=volatility.index)
-        regime_info = {'model': None, 'mapping': {}, 'means': [], 'variances': [], 'weights': []}
-        return regimes, regime_info
+        if not clean_vol.empty and num_regimes_target >= 1:
+            regimes.loc[clean_vol.index] = 0 
+            mean_val = clean_vol.mean()
+            var_val = clean_vol.var(ddof=0) if len(clean_vol) > 0 else 0.0 
+            
+            # Fill only the first element of the default lists
+            current_regime_info = default_regime_info.copy()
+            current_regime_info['mapping'] = {0:0}
+            if num_regimes_target > 0:
+                current_regime_info['means'][0] = mean_val
+                current_regime_info['variances'][0] = var_val if not pd.isna(var_val) else np.nan
+                current_regime_info['weights'][0] = 1.0
+                # Fill remaining weights with 0.0 if target > 1
+                for i in range(1, num_regimes_target):
+                    current_regime_info['weights'][i] = 0.0
+            return regimes, current_regime_info
+        else: 
+            return regimes, default_regime_info
+
 
     X = clean_vol.values.reshape(-1, 1)
+    if np.all(X == X[0]): # All volatility values are the same
+        regimes = pd.Series(np.nan, index=volatility.index)
+        regimes.loc[clean_vol.index] = 0 
+        current_regime_info = default_regime_info.copy()
+        current_regime_info['mapping'] = {0:0}
+        if num_regimes_target > 0:
+            current_regime_info['means'][0] = X[0][0]
+            current_regime_info['variances'][0] = 0.0
+            current_regime_info['weights'][0] = 1.0
+            for i in range(1, num_regimes_target):
+                current_regime_info['weights'][i] = 0.0
+        return regimes, current_regime_info
+
     gmm = GaussianMixture(
         n_components=num_regimes_target, covariance_type='full',
-        random_state=random_state, n_init=10
+        random_state=random_state, n_init=10, reg_covar=1e-6 
     )
     try:
         gmm.fit(X)
-    except ValueError as e:
-        print(f"GMM fitting error: {e}. Returning empty regimes.")
+        if not gmm.converged_:
+            print(f"Warning: GMM did not converge for a stock. Results might be suboptimal.")
+    except ValueError as e: 
+        print(f"GMM fitting error: {e}. Falling back to single regime like behavior.")
         regimes = pd.Series(np.nan, index=volatility.index)
-        regime_info = {'model': None, 'mapping': {}, 'means': [], 'variances': [], 'weights': []}
-        return regimes, regime_info
+        regimes.loc[clean_vol.index] = 0
+        mean_val = clean_vol.mean()
+        var_val = clean_vol.var(ddof=0) if len(clean_vol) > 0 else 0.0
+        current_regime_info = default_regime_info.copy()
+        current_regime_info['mapping'] = {0:0}
+        if num_regimes_target > 0:
+            current_regime_info['means'][0] = mean_val
+            current_regime_info['variances'][0] = var_val if not pd.isna(var_val) else np.nan
+            current_regime_info['weights'][0] = 1.0
+            for i in range(1, num_regimes_target):
+                current_regime_info['weights'][i] = 0.0
+        return regimes, current_regime_info
 
-    regime_labels = gmm.predict(X)
-    regimes_clean = pd.Series(regime_labels, index=clean_vol.index)
-
+    regime_labels_raw = gmm.predict(X)
+    
     gmm_means_flat = gmm.means_.flatten()
-    regime_order = np.argsort(gmm_means_flat)
+    regime_order = np.argsort(gmm_means_flat) 
+    
     regime_mapping = {old_label: new_label for new_label, old_label in enumerate(regime_order)}
-
-    regimes_clean = regimes_clean.map(regime_mapping)
-    regimes = pd.Series(np.nan, index=volatility.index)
-    regimes.loc[regimes_clean.index] = regimes_clean
-
-    # gmm.n_components is the actual number of components fitted
-    actual_fitted_regimes = gmm.n_components
-    regime_info = {
-        'model': gmm,
-        'mapping': regime_mapping,
-        'means': [gmm.means_[regime_order[i]][0] for i in range(actual_fitted_regimes)],
-        'variances': [gmm.covariances_[regime_order[i]][0][0] for i in range(actual_fitted_regimes)],
-        'weights': [gmm.weights_[regime_order[i]] for i in range(actual_fitted_regimes)]
+    regimes_clean = pd.Series(regime_labels_raw, index=clean_vol.index).map(regime_mapping) 
+    
+    regimes = pd.Series(np.nan, index=volatility.index) 
+    regimes.loc[regimes_clean.index] = regimes_clean 
+    
+    actual_fitted_components = gmm.n_components 
+    
+    final_regime_info = {
+        'model': gmm, 
+        'mapping': regime_mapping, 
+        'means': [gmm.means_[regime_order[i]][0] if i < actual_fitted_components else np.nan for i in range(num_regimes_target)],
+        'variances': [gmm.covariances_[regime_order[i]][0][0] if i < actual_fitted_components else np.nan for i in range(num_regimes_target)],
+        'weights': [gmm.weights_[regime_order[i]] if i < actual_fitted_components else 0.0 for i in range(num_regimes_target)]
     }
-    return regimes, regime_info
-
+    return regimes, final_regime_info
 
 def analyze_stock_with_gmm(symbol, data, window=20, num_regimes_target=3, prior_strength=1.0,
-                          start_date='2021-01-01', end_date='2025-05-14'):
-    data = filter_data_by_date(data, start_date, end_date)
-    if data.empty:
-        print(f"No data for {symbol} in period {start_date}-{end_date}.")
+                          start_date='2010-01-01', end_date='2025-05-14'):
+    if data is None or data.empty:
+        return None
+    data_filtered = filter_data_by_date(data, start_date, end_date) 
+    if data_filtered.empty:
         return None
 
-    volatility = calculate_volatility(data, window)
-    if volatility.dropna().empty:
-        print(f"Not enough data for {symbol} to calculate volatility.")
-        return None
+    base_index = data_filtered.index 
+    ohlc_cols_present = [col for col in ['open', 'high', 'low', 'close'] if col in data_filtered.columns]
+    ohlc_df_for_results = data_filtered[ohlc_cols_present].copy() if ohlc_cols_present else pd.DataFrame(index=base_index)
+
+
+    empty_results = {
+        'symbol': symbol, 
+        'ohlc_data_filtered': ohlc_df_for_results,
+        'volatility': pd.Series(dtype=float, index=base_index), 
+        'regimes': pd.Series(dtype=float, index=base_index), 
+        'regime_info': {'means': [np.nan]*num_regimes_target, 
+                        'variances': [np.nan]*num_regimes_target, 
+                        'weights': [np.nan]*num_regimes_target}, 
+        'transition_counts': np.zeros((num_regimes_target, num_regimes_target)),
+        'transition_probabilities': np.full((num_regimes_target, num_regimes_target), np.nan),
+        'lower_probabilities': {i: np.full(num_regimes_target, np.nan) for i in range(num_regimes_target)}, 
+        'upper_probabilities': {i: np.full(num_regimes_target, np.nan) for i in range(num_regimes_target)},
+        'current_regime': None, 
+        'actual_num_regimes': 0,
+        'regime_return_statistics': [] # For new stats
+    }
+
+    volatility = calculate_volatility(data_filtered, window) 
+    if volatility is None or volatility.dropna().empty: 
+        if volatility is not None: empty_results['volatility'] = volatility
+        return empty_results 
+    empty_results['volatility'] = volatility
 
     regimes, regime_info = identify_volatility_regimes_gmm(volatility, num_regimes_target)
+    empty_results['regimes'] = regimes 
+    empty_results['regime_info'] = regime_info 
 
-    if not regime_info['means']: # GMM failed or no components found
-        print(f"GMM could not identify regimes for {symbol}.")
-        return None
+    actual_num_regimes_found = 0
+    if regime_info and regime_info.get('means'):
+        actual_num_regimes_found = sum(1 for m in regime_info['means'][:num_regimes_target] if not pd.isna(m))
+    empty_results['actual_num_regimes'] = actual_num_regimes_found
+
+    if actual_num_regimes_found == 0:
+         return empty_results 
+
+    # Resize outputs based on actual_num_regimes_found if it's less than num_regimes_target
+    # but ensure they are at least 1x1 if actual_num_regimes_found is 1
+    effective_dim_for_matrix = max(1, actual_num_regimes_found)
+
+    tc_raw = count_transitions(regimes)
+    # tc_for_bayes should be square based on effective_dim_for_matrix (num distinct regimes seen in data up to GMM target)
+    # Ensure tc_for_bayes uses the number of regimes actually identified and used for labeling (0 to N-1)
+    num_distinct_labels_in_regimes = 0
+    if not regimes.dropna().empty:
+        num_distinct_labels_in_regimes = int(regimes.dropna().max()) + 1 if regimes.dropna().max() >=0 else 0
     
-    actual_num_regimes_identified_by_gmm = len(regime_info['means'])
+    # The dimension for Bayesian analysis should be the number of regimes that GMM *tried* to fit 
+    # if it produced valid means for them, or the max label if GMM reduced components.
+    # Use actual_num_regimes_found as the basis for transition matrix sizes related to GMM output.
+    dim_bayes = actual_num_regimes_found
 
-    transition_counts = count_transitions(regimes)
-
-    # Ensure transition_counts matrix matches the number of GMM identified regimes
-    if transition_counts.shape[0] != actual_num_regimes_identified_by_gmm:
-        new_tc = np.zeros((actual_num_regimes_identified_by_gmm, actual_num_regimes_identified_by_gmm))
-        if transition_counts.ndim == 2 and transition_counts.shape[0] > 0 : # if some transitions were counted
-            min_dim0 = min(transition_counts.shape[0], actual_num_regimes_identified_by_gmm)
-            min_dim1 = min(transition_counts.shape[1], actual_num_regimes_identified_by_gmm)
-            new_tc[:min_dim0, :min_dim1] = transition_counts[:min_dim0, :min_dim1]
-        transition_counts = new_tc
+    tc_for_bayes = np.zeros((dim_bayes, dim_bayes))
+    if tc_raw.shape[0] > 0 and tc_raw.shape[1] > 0 : # If count_transitions produced something
+        common_dim = min(tc_raw.shape[0], dim_bayes)
+        tc_for_bayes[:common_dim, :common_dim] = tc_raw[:common_dim, :common_dim]
+    empty_results['transition_counts'] = tc_for_bayes
     
-    if actual_num_regimes_identified_by_gmm == 0: # If after all GMM had no regimes
-        print(f"No GMM regimes for {symbol} to analyze transitions.")
-        return None
+    mean_probs, posterior_samples = bayesian_transition_analysis(tc_for_bayes, prior_strength)
+    # Ensure mean_probs and posterior_samples structure matches dim_bayes
+    if mean_probs.shape[0] != dim_bayes: # Should not happen if tc_for_bayes is correct
+        mean_probs = np.full((dim_bayes, dim_bayes), np.nan)
+        posterior_samples = {i: np.array([]) for i in range(dim_bayes)}
+    empty_results['transition_probabilities'] = mean_probs
 
-
-    mean_probs, posterior_samples = bayesian_transition_analysis(transition_counts, prior_strength)
-    if not posterior_samples and actual_num_regimes_identified_by_gmm > 0: # Check if posterior_samples is empty
-        print(f"Bayesian analysis failed for {symbol} (posterior_samples empty).")
-        # Provide default empty structures if needed, or return None
-        # For robust downstream processing, let's ensure mean_probs matches expected GMM regime count
-        if mean_probs.shape[0] != actual_num_regimes_identified_by_gmm:
-            mean_probs = np.full((actual_num_regimes_identified_by_gmm, actual_num_regimes_identified_by_gmm), np.nan)
-        # Create empty dicts for lower/upper probs
-        lower_probs = {i: [np.nan]*actual_num_regimes_identified_by_gmm for i in range(actual_num_regimes_identified_by_gmm)}
-        upper_probs = {i: [np.nan]*actual_num_regimes_identified_by_gmm for i in range(actual_num_regimes_identified_by_gmm)}
-    elif actual_num_regimes_identified_by_gmm == 0: # GMM found no regimes
-        mean_probs = np.array([])
-        lower_probs, upper_probs = {}, {}
-    else:
-        lower_probs, upper_probs = calculate_probability_intervals(posterior_samples)
-
-
+    lower_probs, upper_probs = calculate_probability_intervals(posterior_samples)
+    empty_results['lower_probabilities'] = {i: (lower_probs.get(i, np.full(dim_bayes, np.nan))) for i in range(dim_bayes)}
+    empty_results['upper_probabilities'] = {i: (upper_probs.get(i, np.full(dim_bayes, np.nan))) for i in range(dim_bayes)}
+    
     current_regime = None
     cleaned_regimes = regimes.dropna()
     if not cleaned_regimes.empty:
-        current_regime = int(cleaned_regimes.iloc[-1])
-        # Validate current_regime against number of identified regimes
-        if not (0 <= current_regime < actual_num_regimes_identified_by_gmm):
-            print(f"Warning: Current regime {current_regime} for {symbol} is out of bounds for GMM identified regimes ({actual_num_regimes_identified_by_gmm}). Setting to None.")
-            current_regime = None # Or handle as an error
+        last_regime_val = cleaned_regimes.iloc[-1]
+        if not pd.isna(last_regime_val):
+            current_regime = int(last_regime_val)
+            if not (0 <= current_regime < actual_num_regimes_found): # Check against actual regimes found
+                current_regime = None 
+    empty_results['current_regime'] = current_regime
     
-    if current_regime is None and actual_num_regimes_identified_by_gmm > 0: # If we expected a current regime but couldn't get one
-         print(f"No valid current regime found for {symbol} despite GMM identifying regimes.")
-         # Potentially set to a default or return None
-         # For now, we'll allow it to proceed and it will result in NaNs for current regime stats
+    # --- Calculate Regime Return Statistics ---
+    if 'close' in data_filtered.columns and actual_num_regimes_found > 0:
+        prices_for_returns = data_filtered['close']
+        daily_log_ret = pd.Series(np.nan, index=prices_for_returns.index, dtype=float)
+        shifted_prices = prices_for_returns.shift(1)
+        valid_idx_ret = (prices_for_returns > 0) & (shifted_prices > 0) & (~prices_for_returns.isnull()) & (~shifted_prices.isnull())
+        if valid_idx_ret.any():
+            daily_log_ret[valid_idx_ret] = np.log(prices_for_returns[valid_idx_ret] / shifted_prices[valid_idx_ret])
 
+        # Align daily_log_ret with regimes (both should be on data_filtered.index)
+        # regimes Series might have NaNs at the start due to volatility window
+        stats_data = pd.DataFrame({'LogReturn': daily_log_ret, 'Regime': regimes}).dropna()
 
-    results = {
-        'symbol': symbol, 'volatility': volatility, 'regimes': regimes,
-        'regime_info': regime_info, 'transition_counts': transition_counts,
-        'transition_probabilities': mean_probs,
-        # 'posterior_samples': posterior_samples, # Usually large, can omit from final stored results if not directly used later
-        'lower_probabilities': lower_probs, 'upper_probabilities': upper_probs,
-        'current_regime': current_regime,
-        'actual_num_regimes': actual_num_regimes_identified_by_gmm # Store this important piece of info
-    }
-    return results
+        regime_stats_list = []
+        if not stats_data.empty:
+            for i in range(actual_num_regimes_found): # Iterate through sorted, identified regimes
+                regime_specific_returns = stats_data[stats_data['Regime'] == i]['LogReturn']
+                n_days = len(regime_specific_returns)
+                if n_days > 0:
+                    mean_ret = regime_specific_returns.mean()
+                    std_ret = regime_specific_returns.std()
+                    skew_ret = regime_specific_returns.skew() if n_days > 2 else np.nan # Skew needs >2 points
+                    kurt_ret = regime_specific_returns.kurtosis() if n_days > 3 else np.nan # Kurtosis needs >3
+                    total_ret_comp = np.exp(regime_specific_returns.sum()) - 1
+                    
+                    sharpe = np.nan
+                    if std_ret > 0 and not pd.isna(std_ret) and not pd.isna(mean_ret):
+                        sharpe = (mean_ret * np.sqrt(252)) / std_ret # Annualized Sharpe
+                    
+                    regime_stats_list.append({
+                        'Regime': i,
+                        'N_Days': n_days,
+                        'Mean_Daily_Log_Return': mean_ret,
+                        'StdDev_Daily_Log_Return': std_ret,
+                        'Annualized_Sharpe_Ratio': sharpe,
+                        'Skewness_Daily_Log_Return': skew_ret,
+                        'Kurtosis_Daily_Log_Return': kurt_ret,
+                        'Total_Compounded_Log_Return': total_ret_comp
+                    })
+                else: # No days in this regime (e.g. GMM assigned it 0 weight or no data fell into it)
+                     regime_stats_list.append({
+                        'Regime': i, 'N_Days': 0, 'Mean_Daily_Log_Return': np.nan,
+                        'StdDev_Daily_Log_Return': np.nan, 'Annualized_Sharpe_Ratio': np.nan,
+                        'Skewness_Daily_Log_Return': np.nan, 'Kurtosis_Daily_Log_Return': np.nan,
+                        'Total_Compounded_Log_Return': np.nan
+                    })
+        empty_results['regime_return_statistics'] = regime_stats_list
+    return empty_results
 
 def save_stock_excel_report(results, symbol, save_dir):
-    """Saves the analysis results for a single stock to an Excel file with two sheets."""
     if results is None:
-        print(f"No results to save for {symbol}.")
+        # print(f"No results to save for {symbol}.")
         return
 
     output_path = os.path.join(save_dir, f"{symbol}_analysis_results.xlsx")
     
     try:
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # --- Sheet 1: Regime_Parameters ---
+            # --- Sheet 1: Volatility_Regime_TS (with OHLC) ---
+            df_vol_reg_ts = pd.DataFrame(index=results.get('ohlc_data_filtered', pd.DataFrame()).index)
+            if df_vol_reg_ts.empty and results.get('volatility') is not None and not results.get('volatility').empty:
+                 df_vol_reg_ts = pd.DataFrame(index=results.get('volatility').index)
+
+
+            ohlc_data = results.get('ohlc_data_filtered')
+            if ohlc_data is not None and not ohlc_data.empty:
+                for col in ['open', 'high', 'low', 'close']: # Explicitly add OHLC
+                    if col in ohlc_data.columns:
+                        df_vol_reg_ts[col.capitalize()] = ohlc_data[col]
+            
+            volatility_series = results.get('volatility')
+            if volatility_series is not None and not volatility_series.empty:
+                df_vol_reg_ts['Volatility'] = volatility_series
+            
+            regimes_series = results.get('regimes')
+            if regimes_series is not None and not regimes_series.empty:
+                df_vol_reg_ts['Identified_Regime'] = regimes_series
+
+            if not df_vol_reg_ts.empty:
+                if isinstance(df_vol_reg_ts.index, pd.DatetimeIndex):
+                     df_vol_reg_ts.index.name = 'Date'
+                df_vol_reg_ts.to_excel(writer, sheet_name='Volatility_Regime_TS', index=True)
+            else:
+                pd.DataFrame([{"Status": "Time series data (OHLC, Vol, Regime) not available."}]).to_excel(writer, sheet_name='Volatility_Regime_TS', index=False)
+
+            # --- Sheet 2: Regime_Parameters ---
+            # (Code for this sheet remains largely the same as your provided version)
             regime_info = results.get('regime_info', {})
             num_actual_regimes = results.get('actual_num_regimes', 0)
-
-            regime_data = []
+            regime_data_params = []
             if num_actual_regimes > 0 and regime_info.get('means'):
-                for i in range(num_actual_regimes):
+                for i in range(num_actual_regimes): # Iterate up to actual regimes found by GMM
                     mean_vol = regime_info['means'][i] if i < len(regime_info['means']) else np.nan
                     variance = regime_info['variances'][i] if i < len(regime_info['variances']) else np.nan
                     std_dev_vol = np.sqrt(variance) if not pd.isna(variance) and variance >=0 else np.nan
                     weight = regime_info['weights'][i] if i < len(regime_info['weights']) else np.nan
-                    regime_data.append({
-                        'Regime': i,
-                        'Mean_Volatility': mean_vol,
-                        'StdDev_Volatility': std_dev_vol,
-                        'GMM_Weight': weight
+                    regime_data_params.append({
+                        'Regime': i, 'Mean_Volatility': mean_vol,
+                        'StdDev_Volatility': std_dev_vol, 'GMM_Weight': weight
                     })
-            
-            df_regime_params = pd.DataFrame(regime_data)
+            df_regime_params = pd.DataFrame(regime_data_params)
             if not df_regime_params.empty:
                 df_regime_params.to_excel(writer, sheet_name='Regime_Parameters', index=False)
-            else: # Write an empty placeholder or a message
-                pd.DataFrame([{"Status": "No regime parameters identified"}]).to_excel(writer, sheet_name='Regime_Parameters', index=False)
+            else:
+                pd.DataFrame([{"Status": "No GMM regime parameters identified."}]).to_excel(writer, sheet_name='Regime_Parameters', index=False)
 
-
-            # --- Sheet 2: Current_Regime_Transitions ---
+            # --- Sheet 3: Current_Regime_Transitions ---
+            # (Code for this sheet remains largely the same)
             current_regime = results.get('current_regime')
             transition_probs_matrix = results.get('transition_probabilities')
             lower_probs_dict = results.get('lower_probabilities', {})
             upper_probs_dict = results.get('upper_probabilities', {})
-            
             transition_data = []
             if current_regime is not None and \
                transition_probs_matrix is not None and transition_probs_matrix.ndim == 2 and \
-               0 <= current_regime < transition_probs_matrix.shape[0]:
+               0 <= current_regime < transition_probs_matrix.shape[0] and \
+               num_actual_regimes > 0 and transition_probs_matrix.shape[1] == num_actual_regimes:
                 
                 current_probs_row = transition_probs_matrix[current_regime]
-                current_lower_row = lower_probs_dict.get(current_regime, [np.nan] * num_actual_regimes)
-                current_upper_row = upper_probs_dict.get(current_regime, [np.nan] * num_actual_regimes)
+                current_lower_row = lower_probs_dict.get(current_regime, np.full(num_actual_regimes, np.nan))
+                current_upper_row = upper_probs_dict.get(current_regime, np.full(num_actual_regimes, np.nan))
+                # Ensure correct length for CI arrays
+                if not isinstance(current_lower_row, np.ndarray) or len(current_lower_row) != num_actual_regimes:
+                    current_lower_row = np.full(num_actual_regimes, np.nan)
+                if not isinstance(current_upper_row, np.ndarray) or len(current_upper_row) != num_actual_regimes:
+                    current_upper_row = np.full(num_actual_regimes, np.nan)
 
                 for to_regime in range(num_actual_regimes):
                     transition_data.append({
-                        'From_Regime': current_regime,
-                        'To_Regime': to_regime,
+                        'From_Regime': current_regime, 'To_Regime': to_regime,
                         'Mean_Probability': current_probs_row[to_regime] if to_regime < len(current_probs_row) else np.nan,
                         '95%_CI_Lower': current_lower_row[to_regime] if to_regime < len(current_lower_row) else np.nan,
                         '95%_CI_Upper': current_upper_row[to_regime] if to_regime < len(current_upper_row) else np.nan,
                     })
-            
             df_transitions = pd.DataFrame(transition_data)
             if not df_transitions.empty:
-                 # Add a header row for current regime
                 df_header = pd.DataFrame([{"Current_Regime_Analyzed": current_regime if current_regime is not None else "N/A"}])
                 df_header.to_excel(writer, sheet_name='Current_Regime_Transitions', index=False, header=True, startrow=0)
-                df_transitions.to_excel(writer, sheet_name='Current_Regime_Transitions', index=False, startrow=2) # Start data after header
+                df_transitions.to_excel(writer, sheet_name='Current_Regime_Transitions', index=False, startrow=2)
             else:
-                pd.DataFrame([{"Status": "No transition probabilities from current regime available or current regime not identified."}]).to_excel(writer, sheet_name='Current_Regime_Transitions', index=False)
+                pd.DataFrame([{"Status": "Transition data from current regime not available."}]).to_excel(writer, sheet_name='Current_Regime_Transitions', index=False)
 
-        # print(f"Saved Excel report for {symbol} to {output_path}") # Can be verbose
+            # --- Sheet 4: Regime_Return_Stats (New) ---
+            regime_return_stats_list = results.get('regime_return_statistics', [])
+            if regime_return_stats_list: # Check if list is not empty
+                df_regime_return_stats = pd.DataFrame(regime_return_stats_list)
+                if not df_regime_return_stats.empty:
+                    df_regime_return_stats.to_excel(writer, sheet_name='Regime_Return_Stats', index=False)
+                else:
+                    pd.DataFrame([{"Status": "Regime return statistics could not be computed or regimes had no data."}]).to_excel(writer, sheet_name='Regime_Return_Stats', index=False)
+            else:
+                 pd.DataFrame([{"Status": "No regime return statistics available."}]).to_excel(writer, sheet_name='Regime_Return_Stats', index=False)
+
     except Exception as e:
-        print(f"Error saving Excel report for {symbol}: {e}")
+        print(f"Error saving Excel report for {symbol} to {output_path}: {e}")
 
 
-# Worker function for multiprocessing
+# Worker function for multiprocessing calculations
 def process_stock_wrapper(args_tuple):
-    symbol, data_df, window, num_regimes_target, prior_strength, start_date, end_date, intermediate_save_dir = args_tuple
-    # Filename includes key parameters to distinguish cache for different settings
-    params_str = f"w{window}_r{num_regimes_target}_p{prior_strength}_sd{start_date.replace('-', '')}_ed{end_date.replace('-', '') if end_date else 'None'}"
+    symbol, data_df, window, num_regimes_target, prior_strength, start_date, end_date_str, intermediate_save_dir = args_tuple
+    sd_str = start_date.replace('-', '') if start_date else "None"
+    ed_str = end_date_str.replace('-', '') if end_date_str else "None"
+    params_str = f"w{window}_r{num_regimes_target}_p{prior_strength}_sd{sd_str}_ed{ed_str}_v2" # Added version to param str
     checkpoint_file = os.path.join(intermediate_save_dir, f"{symbol}_results_{params_str}.pkl")
 
-
-    if os.path.exists(checkpoint_file):
+    if os.path.exists(checkpoint_file): # Add force_recompute check here if passed down
         try:
             with open(checkpoint_file, 'rb') as f:
                 results = pickle.load(f)
-            if results and results.get('symbol') == symbol: # Basic validation
-                return symbol, results
+            if results and isinstance(results, dict) and results.get('symbol') == symbol:
+                 # Add a check for a new key to ensure it's from the new version
+                if 'regime_return_statistics' in results and 'ohlc_data_filtered' in results:
+                    return symbol, results
+                else:
+                    # print(f"Cached data for {symbol} (params: {params_str}) is old version. Recomputing...")
+                    pass # Fall through to recompute
+            else:
+                # print(f"Cached data for {symbol} (params: {params_str}) is invalid. Recomputing...")
+                pass # Fall through
         except Exception as e:
             print(f"Error loading cached results for {symbol} (params: {params_str}): {e}. Recomputing...")
 
+    if data_df is None or data_df.empty : 
+        return symbol, None 
+
     results = analyze_stock_with_gmm(symbol, data_df, window, num_regimes_target, prior_strength,
-                                     start_date, end_date)
-    if results:
+                                     start_date, end_date_str)
+    if results: 
         try:
             with open(checkpoint_file, 'wb') as f:
                 pickle.dump(results, f)
@@ -340,172 +602,238 @@ def process_stock_wrapper(args_tuple):
             print(f"Error saving intermediate results for {symbol} to {checkpoint_file}: {e}")
     return symbol, results
 
+# Worker function for multiprocessing Excel report generation
+def save_stock_excel_report_wrapper(args_tuple):
+    results_obj, symbol_key, report_save_dir = args_tuple
+    if results_obj:
+        save_stock_excel_report(results_obj, symbol_key, report_save_dir)
+    return symbol_key # Return symbol to indicate completion if needed
+
 
 def run_gmm_analysis(folder_path=DATA_PATH, window=20, num_regimes_target=3, prior_strength=1.0,
-                   save_dir="volatility_excel_reports", start_date='2021-01-01', end_date='2025-05-14',
+                   save_dir="volatility_excel_reports", start_date='2010-01-01', end_date='2025-05-14',
                    num_processes=None, force_recompute=False):
     print(f"Loading stock data from {folder_path}...")
     all_stock_data_loaded = load_stock_data(folder_path)
-
     if not all_stock_data_loaded:
-        print("No valid stock data found.")
+        print("No valid stock data found after loading attempts.")
         return {}, []
 
-    print(f"Found {len(all_stock_data_loaded)} stock datasets.")
-    print(f"Analysis period: {start_date} to {end_date if end_date else 'latest available'}")
+    print(f"Found {len(all_stock_data_loaded)} stock datasets for potential analysis.")
+    effective_end_date_str = end_date if end_date else datetime.now().strftime('%Y-%m-%d')
+    print(f"Analysis period: {start_date} to {effective_end_date_str}")
 
     results_dir = save_dir
     os.makedirs(results_dir, exist_ok=True)
-    intermediate_results_dir = os.path.join(results_dir, "intermediate_calc_results")
+    intermediate_results_dir = os.path.join(results_dir, "intermediate_calc_results_v2") # Versioned intermediate dir
     os.makedirs(intermediate_results_dir, exist_ok=True)
 
     if force_recompute:
         print("Force recompute is ON. Deleting existing intermediate pkl results...")
-        for f_name in os.listdir(intermediate_results_dir):
-            if f_name.endswith(".pkl"):
-                try:
-                    os.remove(os.path.join(intermediate_results_dir, f_name))
-                except Exception as e:
-                    print(f"Error deleting {f_name}: {e}")
+        deleted_count = 0
+        if os.path.exists(intermediate_results_dir):
+            for f_name in os.listdir(intermediate_results_dir):
+                if f_name.endswith(".pkl"): 
+                    try:
+                        os.remove(os.path.join(intermediate_results_dir, f_name))
+                        deleted_count +=1
+                    except Exception as e:
+                        print(f"Error deleting {f_name}: {e}")
+        print(f"Deleted {deleted_count} .pkl files from intermediate cache.")
     
     print("\n--- Starting Calculation Pass ---")
-    tasks = []
+    tasks_calc = []
     for symbol, data_df_orig in all_stock_data_loaded.items():
-        tasks.append((symbol, data_df_orig.copy(), window, num_regimes_target, prior_strength,
-                      start_date, end_date if end_date else datetime.now().strftime('%Y-%m-%d'), 
+        if data_df_orig is None or data_df_orig.empty: 
+            # print(f"Skipping {symbol} for calculation pass as loaded data is empty or None.")
+            continue
+        # Here, process_stock_wrapper needs to know about force_recompute if we want to skip loading from cache
+        # Simplest is to let process_stock_wrapper handle its own cache check, force_recompute deletes all cache before this loop.
+        tasks_calc.append((symbol, data_df_orig.copy(), window, num_regimes_target, prior_strength,
+                      start_date, effective_end_date_str, 
                       intermediate_results_dir))
 
     all_calculated_results = {}
-    if not num_processes:
-        num_processes = os.cpu_count() - 1 if os.cpu_count() and os.cpu_count() > 1 else 1
-    print(f"Using {num_processes} processes for analysis.")
+    if not num_processes: 
+        num_processes = max(1, os.cpu_count() - 1 if os.cpu_count() and os.cpu_count() > 1 else 1)
+    
+    print(f"Using {num_processes} processes for calculations.")
 
-    if tasks:
-        if num_processes > 1 and len(tasks) > 1:
+    if tasks_calc:
+        if num_processes > 1 and len(tasks_calc) > 1: 
             with multiprocessing.Pool(processes=num_processes) as pool:
-                pool_results = pool.map(process_stock_wrapper, tasks)
-        else:
-            print("Running in sequential mode.")
-            pool_results = [process_stock_wrapper(task) for task in tasks]
+                pool_results_calc = pool.map(process_stock_wrapper, tasks_calc)
+        else: 
+            print("Running calculations in sequential mode.")
+            pool_results_calc = [process_stock_wrapper(task) for task in tasks_calc]
         
-        for symbol_key, res_obj in pool_results:
-            if res_obj:
+        for symbol_key, res_obj in pool_results_calc:
+            if res_obj: 
                 all_calculated_results[symbol_key] = res_obj
     
-    print(f"\n--- Calculation Pass Complete. Got results for {len(all_calculated_results)} stocks. ---")
-
+    print(f"\n--- Calculation Pass Complete. Got results for {len(all_calculated_results)} out of {len(tasks_calc)} potential stocks. ---")
     if not all_calculated_results:
-        print("No stocks were successfully analyzed. Exiting.")
+        print("No stocks yielded results from the calculation pass. Exiting report generation.")
         return {}, []
 
     print("\n--- Starting Excel Report Generation Pass ---")
-    summary_data_list = []
-    sorted_symbols = sorted(all_calculated_results.keys())
-
-    for symbol in sorted_symbols:
+    tasks_report = []
+    sorted_symbols_for_report = sorted(all_calculated_results.keys())
+    for symbol in sorted_symbols_for_report:
         results = all_calculated_results[symbol]
+        if results: # Ensure results object exists
+            tasks_report.append((results, symbol, results_dir))
+
+    if tasks_report:
+        # Use num_processes for reporting as well, can be adjusted if I/O bound
+        print(f"Using {num_processes} processes for Excel report generation.")
+        if num_processes > 1 and len(tasks_report) > 1:
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                # pool.map will block until all reports are generated
+                report_gen_symbols = pool.map(save_stock_excel_report_wrapper, tasks_report)
+                # print(f"Generated reports for: {report_gen_symbols}") 
+        else:
+            print("Running Excel report generation in sequential mode.")
+            for task in tasks_report:
+                save_stock_excel_report_wrapper(task)
+    print(f"\n--- Excel Report Generation Pass Complete for {len(tasks_report)} stocks. ---")
+
+
+    print("\n--- Starting Overall Summary Generation ---")
+    summary_data_list = []
+    # Iterate using sorted_symbols_for_report to ensure consistency if some reports failed silently
+    for symbol in sorted_symbols_for_report:
+        results = all_calculated_results.get(symbol) # Use .get in case a symbol was in tasks but somehow not in results
         if results is None:
-            print(f"Skipping report for {symbol} due to no results from calculation pass.")
             continue
         
-        save_stock_excel_report(results, symbol, results_dir) # Save individual Excel
-
-        # Prepare overall summary entry
-        current_regime = results.get('current_regime')
+        current_regime = results.get('current_regime') 
         actual_num_regimes = results.get('actual_num_regimes', 0)
-        regime_info = results.get('regime_info', {})
-        transition_probs_matrix = results.get('transition_probabilities')
+        regime_info = results.get('regime_info', {}) 
+        transition_probs_matrix = results.get('transition_probabilities') 
 
-        summary_entry = {'Symbol': symbol, 'Current_Regime': current_regime}
+        summary_entry = {'Symbol': symbol, 
+                         'Current_Regime': current_regime if current_regime is not None else 'N/A',
+                         'Actual_Num_Regimes': actual_num_regimes
+                        }
         
-        # Current Volatility
         vol_series = results.get('volatility')
         if vol_series is not None and not vol_series.dropna().empty:
-            summary_entry['Current_Volatility'] = vol_series.dropna().iloc[-1]
+            summary_entry['Current_Raw_Volatility'] = vol_series.dropna().iloc[-1]
         else:
-            summary_entry['Current_Volatility'] = np.nan
+            summary_entry['Current_Raw_Volatility'] = np.nan
 
-        # Mean Volatility of Current Regime
-        if current_regime is not None and regime_info.get('means') and 0 <= current_regime < len(regime_info['means']):
+        if current_regime is not None and regime_info.get('means') and \
+           0 <= current_regime < len(regime_info['means']): # Means array matches num_regimes_target
             summary_entry['Regime_Mean_Volatility_Current'] = regime_info['means'][current_regime]
         else:
             summary_entry['Regime_Mean_Volatility_Current'] = np.nan
 
-        # Transition probabilities from current regime
         if current_regime is not None and transition_probs_matrix is not None and \
-           transition_probs_matrix.ndim == 2 and 0 <= current_regime < transition_probs_matrix.shape[0]:
+           transition_probs_matrix.ndim == 2 and 0 <= current_regime < transition_probs_matrix.shape[0] and \
+           actual_num_regimes > 0 and transition_probs_matrix.shape[1] == actual_num_regimes: # Matrix width matches actual_num_regimes
+            
             current_probs_row = transition_probs_matrix[current_regime]
-            if 0 <= current_regime < len(current_probs_row):
+            if 0 <= current_regime < actual_num_regimes: # Check if current_regime is a valid index for the row itself
                  summary_entry['Prob_Stay_Same_Regime'] = current_probs_row[current_regime]
             else:
                 summary_entry['Prob_Stay_Same_Regime'] = np.nan
-
-            for i in range(actual_num_regimes): # actual_num_regimes comes from results dict
+            
+            for i in range(actual_num_regimes): # Probs to actual regimes
                 summary_entry[f'Prob_To_Regime_{i}'] = current_probs_row[i] if i < len(current_probs_row) else np.nan
-        else: # Fill with NaNs if no current regime or probs
+        else: 
             summary_entry['Prob_Stay_Same_Regime'] = np.nan
-            for i in range(num_regimes_target): # Use target as fallback for column names
-                 summary_entry[f'Prob_To_Regime_{i}'] = np.nan
-
-
-        # Parameters for all GMM regimes
-        for i in range(actual_num_regimes):
-            summary_entry[f'Regime_{i}_Mean_Vol'] = regime_info['means'][i] if regime_info.get('means') and i < len(regime_info['means']) else np.nan
-            var = regime_info['variances'][i] if regime_info.get('variances') and i < len(regime_info['variances']) else np.nan
-            summary_entry[f'Regime_{i}_StdDev_Vol'] = np.sqrt(var) if not pd.isna(var) and var >=0 else np.nan
-            summary_entry[f'Regime_{i}_Weight'] = regime_info['weights'][i] if regime_info.get('weights') and i < len(regime_info['weights']) else np.nan
+            for i in range(num_regimes_target): 
+                 summary_entry[f'Prob_To_Regime_{i}'] = np.nan # Pad to target
         
+        # Pad Prob_To_Regime columns if actual_num_regimes < num_regimes_target
+        if actual_num_regimes < num_regimes_target:
+            for i in range(actual_num_regimes, num_regimes_target):
+                summary_entry[f'Prob_To_Regime_{i}'] = np.nan
+
+
+        for i in range(num_regimes_target): 
+            if i < actual_num_regimes and regime_info.get('means') and i < len(regime_info['means']): 
+                summary_entry[f'Regime_{i}_Mean_Vol'] = regime_info['means'][i]
+                var = regime_info['variances'][i] if regime_info.get('variances') and i < len(regime_info['variances']) else np.nan
+                summary_entry[f'Regime_{i}_StdDev_Vol'] = np.sqrt(var) if not pd.isna(var) and var >=0 else np.nan
+                summary_entry[f'Regime_{i}_Weight'] = regime_info['weights'][i] if regime_info.get('weights') and i < len(regime_info['weights']) else np.nan
+            else: 
+                summary_entry[f'Regime_{i}_Mean_Vol'] = np.nan
+                summary_entry[f'Regime_{i}_StdDev_Vol'] = np.nan
+                summary_entry[f'Regime_{i}_Weight'] = np.nan
+        
+        # Add key stats from new regime_return_statistics to summary
+        regime_return_stats = results.get('regime_return_statistics', [])
+        for i in range(num_regimes_target):
+            stat_for_regime_i = next((stat for stat in regime_return_stats if stat['Regime'] == i), None)
+            if stat_for_regime_i:
+                summary_entry[f'Regime_{i}_Mean_Daily_LogRet'] = stat_for_regime_i.get('Mean_Daily_Log_Return', np.nan)
+                summary_entry[f'Regime_{i}_Sharpe'] = stat_for_regime_i.get('Annualized_Sharpe_Ratio', np.nan)
+                summary_entry[f'Regime_{i}_N_Days'] = stat_for_regime_i.get('N_Days', np.nan)
+            else:
+                summary_entry[f'Regime_{i}_Mean_Daily_LogRet'] = np.nan
+                summary_entry[f'Regime_{i}_Sharpe'] = np.nan
+                summary_entry[f'Regime_{i}_N_Days'] = np.nan
+
         summary_data_list.append(summary_entry)
 
     if summary_data_list:
         summary_df = pd.DataFrame(summary_data_list)
         if not summary_df.empty:
+            cols_order = ['Symbol', 'Current_Regime', 'Actual_Num_Regimes', 'Current_Raw_Volatility', 'Regime_Mean_Volatility_Current', 'Prob_Stay_Same_Regime']
+            for i in range(num_regimes_target): cols_order.append(f'Prob_To_Regime_{i}')
+            for i in range(num_regimes_target):
+                cols_order.append(f'Regime_{i}_Mean_Vol')
+                cols_order.append(f'Regime_{i}_StdDev_Vol')
+                cols_order.append(f'Regime_{i}_Weight')
+                cols_order.append(f'Regime_{i}_N_Days')
+                cols_order.append(f'Regime_{i}_Mean_Daily_LogRet')
+                cols_order.append(f'Regime_{i}_Sharpe')
+            
+            final_cols = [col for col in cols_order if col in summary_df.columns]
+            summary_df = summary_df[final_cols]
             summary_df.sort_values('Symbol', inplace=True)
-            summary_path = os.path.join(results_dir, 'overall_analysis_summary.xlsx')
+            summary_path = os.path.join(results_dir, 'overall_analysis_summary_v2.xlsx') # Versioned summary
             try:
                 summary_df.to_excel(summary_path, index=False, engine='openpyxl')
                 print(f"\nOverall summary saved to {summary_path}")
             except Exception as e:
                 print(f"Error saving overall summary Excel: {e}")
         else:
-            print("Summary data list was populated but resulted in an empty DataFrame. No overall summary saved.")
+            print("Summary data list was populated but resulted in an empty DataFrame.")
     else:
         print("No summary data generated for the overall report.")
 
-    print("\n--- Excel Report Generation Pass Complete ---")
+    print("\n--- Overall Summary Generation Complete ---")
     return all_calculated_results, summary_data_list
 
 
 if __name__ == "__main__":
-    # --- Configuration ---
-    data_folder = DATA_PATH
-    output_save_dir = "volatility_analysis_excel_output"
+    data_folder = DATA_PATH 
+    output_save_dir = "volatility_analysis_excel_output_v5_parallel_ohlc_stats" # New output folder
 
     window_size = 20
-    num_target_regimes_for_gmm = 3 # GMM will try to find this many, might find fewer
+    num_target_regimes_for_gmm = 3
     bayesian_prior_strength = 1.0
     analysis_start_date = '2010-01-01'
-    analysis_end_date = '2025-05-15' # Use None for up to most recent data in CSVs
+    analysis_end_date = None 
 
-    num_parallel_processes = None # os.cpu_count() - 1 or specific number e.g. 4
-    force_recomputation_on_rerun = False # Set to True to ignore cached .pkl files
+    num_parallel_processes = None 
+    force_recomputation_on_rerun = False 
 
-    print("Bayesian Volatility Regime Analysis with GMM - Excel Output\n")
+    print("Bayesian Volatility Regime Analysis with GMM - Excel Output (with Volatility & Regime Time Series)\n")
     print(f"Analysis Parameters:")
     print(f"- Data folder: {data_folder}")
     print(f"- Output directory: {output_save_dir}")
     print(f"- Volatility window: {window_size} days")
     print(f"- Target number of GMM regimes: {num_target_regimes_for_gmm}")
     print(f"- Prior strength for Bayesian transitions: {bayesian_prior_strength}")
-    print(f"- Analysis period: {analysis_start_date} to {analysis_end_date if analysis_end_date else 'latest'}")
+    print(f"- Analysis period: {analysis_start_date} to {analysis_end_date if analysis_end_date else 'latest in data'}")
     print(f"- Number of parallel processes: {'Default (CPU count - 1)' if num_parallel_processes is None else num_parallel_processes}")
     print(f"- Force recomputation of intermediate files: {force_recomputation_on_rerun}")
 
-    # On Windows, 'spawn' is often more stable for multiprocessing with complex objects.
-    # if os.name == 'nt': 
-    #    multiprocessing.set_start_method('spawn', force=True)
-
-    results_dict, summary_list = run_gmm_analysis(
+    results_dict, summary_list_data = run_gmm_analysis(
         folder_path=data_folder,
         window=window_size,
         num_regimes_target=num_target_regimes_for_gmm,
@@ -520,6 +848,6 @@ if __name__ == "__main__":
     print("\nAnalysis complete!")
     if results_dict:
         print(f"Successfully processed and generated data for {len(results_dict)} stocks.")
-    if summary_list:
-        print(f"Generated overall summary data for {len(summary_list)} stocks.")
+    if summary_list_data: 
+        print(f"Generated overall summary data for {len(summary_list_data)} stocks.")
     print(f"All Excel reports and summary saved in: {os.path.abspath(output_save_dir)}")
