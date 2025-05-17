@@ -12,7 +12,7 @@ import multiprocessing # For parallel processing
 # Ensure openpyxl is installed: pip install openpyxl
 
 # Set the path to your data
-DATA_PATH = r"C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\5.16" # Example Path
+DATA_PATH = r"C:\Users\cinco\Desktop\Cinco-Quant\00_raw_data\test" # Example Path
 
 def load_stock_data(folder_path):
     """Load all CSV files from a folder into a dictionary of dataframes, standardizing OHLC column names."""
